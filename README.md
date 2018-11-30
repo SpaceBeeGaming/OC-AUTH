@@ -7,4 +7,4 @@ A sort of Authentication system for OpenComputers.
 
 If you find bugs open a issue or if you feel competent, fix it yourself and make a pull request.
 
-If you have a question open a issue and add the "Question" label.
+If you have a question, open a issue and add the "Question" label.

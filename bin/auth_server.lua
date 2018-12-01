@@ -1,193 +1,161 @@
+--Require
 local component = require("component")
 local data = component.data
 local modem = component.modem
 local event = require("event")
 local serialization = require("serialization")
-local ttf = require("tableToFile")
 local fs = require("filesystem")
 
+local ttf = require("tableToFile")
+local hexer = require("hexer")
+--endRequire
+
+--Config
 local settingsLocation = "/auth/data/AUTH_SETTINGS.cfg"
+local requests = {"AUTHENTICATE", "GETKEY", "SETKEY", "VERIFY"}
+--endConfig
+
 local settings = ttf.load(settingsLocation)
 
-local requests = {"AUTHENTICATE", "GETKEY", "SETKEY", "VERIFY"}
-
 local internal = {}
-internal.eventHandler = {}
 
-function internal.toHex(cdata)
-  return (cdata:gsub(
-    ".",
-    function(c)
-      return string.format("%02X", string.byte(c))
-    end
-  ))
-end
-
-function internal.fromHex(hex, call)
-  print(call)
-  return (hex:gsub(
-    "..",
-    function(cc)
-      return string.char(tonumber(cc, 16))
-    end
-  ))
-end
-
-function internal.writeFile(name, fileData, override)
-  repeat
-    fileData = serialization.serialize(fileData)
-  until type(fileData) ~= "Table"
-
-  path = settings.SEC_PATH .. name .. ".key"
+function internal.writeFile(name, fileData, override) --Write key files.
+  local path = settings.SEC_PATH .. name .. ".key"
   if (fs.exists(path) and not override) then
-    io.stderr:write("authServer: file <" .. name .. "> already exists.")
     return false, "FILE_EXISTS"
   end
 
-  local file = assert(io.open(path, "wb"))
-  file:write(fileData):close()
+  ttf.save(fileData, path)
   return true
 end
 
-function internal.readFile(name)
+function internal.readFile(name) --read key files.
   local path = settings.SEC_PATH .. name .. ".key"
   if not fs.exists(path) then
-    io.stderr:write("authServer: file for name <" .. name .. "> found.")
-
     return false, "NO_RECORD"
   end
 
-  local file = assert(io.open(path, "rb"))
-  local fileData = file:read("*a")
-  file:close()
-  return fileData
+  return ttf.load(path)
 end
 
-function internal.serializeKey(key)
-  assert(key.type == "userdata")
-  local keyT = {t = key.keyType(), d = internal.toHex(key.serialize())}
-  --local keyS = serialization.serialize(keyT)
-  return keyT
+function internal.serializeKey(key) --Converts keys to hex format.
+  if (key.type ~= "userdata") then
+    return false, "KEY_NOT_VALID_SER"
+  end
+
+  return {t = key.keyType(), d = hexer.toHex(key.serialize())}
 end
 
-function internal.deserialize(keyT)
-  print("Key is: ", type(keyT), "and: ", keyT)
-  print("assert condition: ", type(keyT) == "table" and keyT ~= nil)
-  assert(type(keyT) == "table" and keyT ~= nil, "Key not string or empty")
-  --local keyT = serialization.unserialize(keyS)
-  --print(keyT, err)
-  print(keyT.d, keyT.t)
-  local key = data.deserializeKey(internal.fromHex(keyT.d, "1"), keyT.t)
-  print(key.keyType())
-  return key
+function internal.deserialize(keyT) -- Reverse of previous function.
+  if (type(keyT) ~= "table" or keyT == nil) then
+    return false, "KEY_NOT_VALID_DESER"
+  end
+
+  return data.deserializeKey(hexer.fromHex(keyT.d), keyT.t)
 end
 
-function internal.eventHandler.tableEvent(rAddr, port, _, service, request, name, eData)
-  local e = {
+function internal.authenticate() --TODO
+end
+
+function internal.getKey(e) -- Generates or looksup public/private key pairs.
+  -- Outputs the public key on success.
+  local table_pub
+  if fs.exists(settings.SEC_PATH .. e.name .. ".key") then
+    local key_table, err = internal.readFile(e.name)
+    if not key_table then
+      return false, err
+    end
+
+    table_pub = key_table.pub
+  else
+    local pub, priv = data.generateKeyPair()
+    table_pub = internal.serializeKey(pub)
+    internal.writeFile(e.name, {priv = internal.serializeKey(priv), pub = table_pub})
+  end
+
+  return serialization.serialize(table_pub)
+end
+
+function internal.setKey(e) -- Stores the public key sent by user. Also generates the AES key.
+  -- Returns the AES key on success.
+  local userPub, err1 = internal.deserialize(serialization.unserialize(e.data))
+  if not (userPub) then
+    return false, err1
+  end
+
+  local key_table, err2 = internal.readFile(e.name)
+  if not key_table then
+    return false, err2
+  end
+
+  key_table.aesKey = hexer.toHex(data.md5(data.ecdh(internal.deserialize(key_table["priv"]), userPub)))
+  internal.writeFile(e.name, key_table, true)
+  return true
+end
+
+function internal.verify(e) -- Verifies that both parties have the same AES key.
+  -- Decrypts the data sent by user with local AES key, returns sha256 hash of data sent by user os success.
+  local key_table, err = internal.readFile(e.name)
+  if not key_table then
+    modem.send(e.requester, e.port, e.service, e.request, false, err)
+    return false, err
+  end
+
+  local encString = serialization.unserialize(e.data)
+  return data.sha256(data.decrypt(encString.d, hexer.fromHex(key_table.aesKey), hexer.fromHex(encString.iv)))
+end
+
+function internal.main(e)
+  local result, reason
+  if (e.request == requests[1]) then --AUTHENTICATE, not done
+    result, reason = internal.authenticate()
+  elseif (e.request == requests[2]) then --GETKEY
+    result, reason = internal.getKey(e)
+  elseif (e.request == requests[3]) then --SETKEY
+    result, reason = internal.setKey(e)
+  elseif (e.request == requests[4]) then --VERIFY
+    result, reason = internal.verify(e)
+  else
+    result, reason = false, "UNKNOWN_REQUEST"
+  end
+  modem.send(e.requester, e.port, e.service, e.request, result, reason)
+end
+
+local eventHandler = {}
+
+function eventHandler.tableEvent(rAddr, port, _, service, request, name, eData) -- packs the event arguments.
+  return {
     requester = rAddr,
     port = port,
     service = service,
     request = request,
     name = name,
-    data = eData or "data?"
+    data = eData
   }
-  return e
 end
 
-function internal.eventHandler.processEvent(type, _, ...) --type,to,from,port,dist,serv,req,name,data
-  if (type == "modem_message") then
-    local e = internal.eventHandler.tableEvent(...)
-    if (e.service == "AUTH") then
-      --print(e.request)
-      if (e.request == requests[1]) then --AUTHENTICATE, not done
-        io.stdout:write("Not Implemented")
-      elseif (e.request == requests[2]) then --GETKEY, works
-        local tPub
-        if fs.exists("/auth/data/auth_keys/" .. e.name .. ".key") then
-          --print(true)
-          local tKey = serialization.unserialize(internal.readFile(e.name))
-          if not tKey then
-            modem.send(e.requester, e.port, e.service, e.request, false, "Key Reading failed.")
-            return false
-          end
-          tPub = tKey.pub
-        else
-          local pub, priv = data.generateKeyPair()
-          tPub = internal.serializeKey(pub)
-          local tPriv = internal.serializeKey(priv)
-          internal.writeFile(e.name, {priv = tPriv, pub = tPub})
-        end
-
-        modem.send(e.requester, e.port, e.service, e.request, serialization.serialize(tPub))
-        return true
-      elseif (e.request == requests[3]) then --SETKEY, works !!!
-        print("SETKEY")
-        --print(internal.toHex(serialization.unserialize(e.data).d), serialization.unserialize(e.data).t)
-        local userPub = internal.deserialize(serialization.unserialize(e.data))
-
-        if not (userPub.type == "userdata") then
-          io.stderr:write("Key deserialization failed.")
-          modem.send(e.requester, e.port, e.service, e.request, false, "KEY_NOT_VALID")
-          return false
-        end
-
-        local tKeyS, err = internal.readFile(e.name)
-        if not tKeyS then
-          io.stderr:write("authServer: reading of keyFile failed.")
-          io.stderr:write("authServer: reason was: " .. err)
-          modem.send(e.requester, e.port, e.service, e.request, false, "NO_RECORD")
-          return false
-        end
-        local tKey = serialization.unserialize(tKeyS)
-        print(tKey.priv.d, tKey.priv.t)
-        local priv = internal.deserialize(tKey["priv"])
-        print(priv.type, priv.keyType())
-        --print(internal.fromHex(priv, "2"))
-        tKey.aesKey = internal.toHex(data.md5(data.ecdh(priv, userPub)))
-        internal.writeFile(e.name, tKey, true)
-
-        modem.send(e.requester, e.port, e.service, e.request, true)
-        return true
-      elseif (e.request == requests[4]) then --VERIFY, not tested
-        local tKeyS, err = internal.readFile(e.name)
-        if not tKeyS then
-          io.stderr:write("authServer: reading of keyFile failed.")
-          io.stderr:write("authServer: reason was: " .. err)
-          modem.send(e.requester, e.port, e.service, e.request, false, "NO_RECORD")
-          return false
-        end
-        local tKey = serialization.unserialize(tKeyS)
-        print(tKey.aesKey)
-
-        local tEnc = serialization.unserialize(e.data)
-        print(tEnc.iv)
-        local files = data.decrypt(tEnc.d, internal.fromHex(tKey.aesKey), internal.fromHex(tEnc.iv))
-        local sha = data.sha256(files)
-        internal.writeFile(e.name, tKey, true)
-        modem.send(e.requester, e.port, e.service, e.request, sha)
-      else
-        io.stderr:write("Unknown Request")
-      end
-    end
+function eventHandler.processEvent(_, _, ...) --_type,_to,...(from,port,dist,serv,req,name,data)
+  local e = eventHandler.tableEvent(...)
+  if (e.service == "AUTH") then
+    internal.main(e)
   end
 end
 
 function start()
   print("Started!")
   modem.open(settings.port)
-  event.listen("modem_message", internal.eventHandler.processEvent)
+  event.listen("modem_message", eventHandler.processEvent)
 end
 
 function stop()
+  print("Stopped!")
   event.ignore("modem_message", internal.eventHandler.processEvent)
   modem.close(settings.port)
 end
 
 --Shutup luacheck.
-local debug, debug2 = true, false
+local debug = false
 if debug then
   start()
-end
-if debug2 then
   stop()
 end

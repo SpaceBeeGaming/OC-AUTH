@@ -3,7 +3,7 @@ local component = require("component")
 local data = component.data
 local modem = component.modem
 local fs = require("filesystem")
-local serilization = require("serilization")
+local serialization = require("serialization")
 local dns = require("dns_client")
 
 local ttf = require("tableToFile")
@@ -37,26 +37,19 @@ function internal.readFile(name) --read key files.
 end
 
 function internal.serializeKey(key) --Converts keys to hex format.
-  if (key.type ~= "userdata") then
-    return false, "KEY_NOT_VALID_SER"
-  end
-
+  assert(key.type ~= "userdata", "KEY_NOT_VALID_SER")
   return {t = key.keyType(), d = hexer.toHex(key.serialize())}
 end
 
 function internal.deserializeKey(keyT) -- Reverse of previous function.
-  if (type(keyT) ~= "table" or keyT == nil) then
-    return false, "KEY_NOT_VALID_DESER"
-  end
-
+  assert(type(keyT) ~= "table" or keyT == nil, "KEY_NOT_VALID_DESER")
   return data.deserializeKey(hexer.fromHex(keyT.d), keyT.t)
 end
 
 local crypto = {}
 
-function crypto.loadKeys(args)
-  --args: name
-  return internal.readFile(args.name)
+function crypto.loadKeys(name)
+  return internal.readFile(name)
 end
 
 function crypto.generateKeys()
@@ -72,15 +65,12 @@ function crypto.generateAesKey(args)
   return args.key_table["aesKey"]
 end
 
-function crypto.sendKey(args)
-  --args: key
-  if (args.key["t"] ~= "ec-public") then
-    return false, "Public Key expected."
-  end
+function crypto.sendKey(key, name)
+  assert(key["t"] ~= "ec-public", "Public Key expected.")
 
-  local keyString = serilization.serialize(args.key)
+  local keyString = serialization.serialize(key)
   dns.start()
-  local addr, reason = dns.lookup(args.name)
+  local addr, reason = dns.lookup(name)
   if not addr then
     return false, "DNS_" .. reason
   end
@@ -91,9 +81,7 @@ function crypto.crypt(args)
   --=> {name, iv, text, decrypt}
   --<= false, error/ {encrypted text,iv}
   local keyTable, err = internal.readFile(args.name)
-  if not keyTable then
-    return false, err
-  end
+  assert(keyTable, err)
 
   if args.decrypt then
     return data.decrypt(args.text, hexer.fromHex(keyTable.aesKey), hexer.fromHex(args.iv))
@@ -104,19 +92,73 @@ function crypto.crypt(args)
   end
 end
 
-function crypto.storePub(args)
-  --args: name, key
-  local userPub, err1 = internal.deserializeKey(args.key)
-  if not (userPub) then
-    return false, err1
-  end
+function crypto.storePub(name, key)
+  local userPub, err1 = internal.deserializeKey(key)
+  assert(userPub, err1)
 
-  local key_table, err2 = internal.readFile(args.name)
+  local key_table, err2 = internal.readFile(name)
   if not key_table then
     return false, err2
   end
   key_table.userPub = userPub
-  internal.writeFile(args.name, key_table, true)
+  internal.writeFile(name, key_table, true)
+end
+
+function crypto.storePass(name, pw)
+  local key_table, err = internal.readFile(name)
+  if not key_table then
+    return false, err
+  end
+
+  local pass = hexer.toHex(data.sha256(pw))
+  key_table.pass = pass
+  internal.writeFile(name, key_table, true)
+end
+
+function crypto.checkPass(name, pw)
+  --print(name)
+  local key_table, err = internal.readFile(name)
+  if not key_table then
+    return false, err
+  end
+  if (key_table.pass == hexer.toHex(data.sha256(pw))) then
+    return true
+  else
+    return false, "INCORRECT_PW_OR_USERNAME"
+  end
+end
+
+function crypto.checkBalance(name)
+  local key_table, err = internal.readFile(name)
+  if not key_table then
+    return false, err
+  end
+  return key_table.bal
+end
+
+function crypto.changeBalance(name, amt)
+  local key_table, err = internal.readFile(name)
+  if not key_table then
+    return false, err
+  end
+  if key_table.bal == nil then
+    key_table.bal = 0
+  end
+  if amt < 0 then
+    if (key_table.bal >= math.abs(amt)) then
+      key_table.bal = key_table.bal + amt
+      internal.writeFile(name, key_table, true)
+      return true, key_table.bal
+    else
+      return false, "INSUFF_BALANCE"
+    end
+  elseif amt == 0 then
+    return false, "ZERO_TRANSFER"
+  else
+    key_table.bal = key_table.bal + amt
+    internal.writeFile(name, key_table, true)
+    return true, key_table.bal
+  end
 end
 
 return crypto

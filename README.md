@@ -1,5 +1,7 @@
 # OC-AUTH
 
+### THIS PROJECT IS ABANDONED.
+
 A sort of Authentication system for OpenComputers.
 
 ## Contributing
